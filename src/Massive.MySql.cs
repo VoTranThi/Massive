@@ -1,9 +1,9 @@
 ﻿///////////////////////////////////////////////////////////////////////////////////////////////////
-// Massive v2.0. SQLite specific code
+// Massive v2.0. MySQL specific code
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 // Licensed to you under the New BSD License
 // http://www.opensource.org/licenses/bsd-license.php
-// Massive is copyright (c) 2009-2016 various contributors.
+// Massive is copyright (c) 2009-2017 various contributors.
 // All rights reserved.
 // See for sourcecode, full history and contributors list: https://github.com/FransBouma/Massive
 //
@@ -28,6 +28,7 @@
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 using System;
 using System.Collections.Generic;
+using System.Data;
 using System.Data.Common;
 using System.Dynamic;
 using System.Linq;
@@ -38,7 +39,7 @@ namespace Massive
 	/// Class which provides extension methods for various ADO.NET objects.
 	/// </summary>
 	public static partial class ObjectExtensions
-    {
+	{
 		/// <summary>
 		/// Extension for adding single parameter. 
 		/// </summary>
@@ -54,42 +55,49 @@ namespace Massive
 			}
 			else
 			{
-				var o = value as ExpandoObject;
-				if(o == null)
+				if(value is Guid)
 				{
-					p.Value = value;
-					var s = value as string;
-					if(s != null)
-					{
-						p.Size = s.Length > 4000 ? -1 : 4000;
-					}
+					p.Value = value.ToString();
+					p.DbType = DbType.String;
+					p.Size = 36;
+				}
+				else if(value is ExpandoObject)
+				{
+					var d = (IDictionary<string, object>)value;
+					p.Value = d.Values.FirstOrDefault();
 				}
 				else
 				{
-					p.Value = ((IDictionary<string, object>)value).Values.FirstOrDefault();
+					p.Value = value;
+				}
+				var valueAsString = value as string;
+				if(valueAsString != null)
+				{
+					p.Size = valueAsString.Length > 4000 ? -1 : 4000;
 				}
 			}
 			cmd.Parameters.Add(p);
 		}
 	}
-	
 
-    /// <summary>
-    /// A class that wraps your database table in Dynamic Funtime
-    /// </summary>
-    public partial class DynamicModel
-    {
+
+	/// <summary>
+	/// A class that wraps your database table in Dynamic Funtime
+	/// </summary>
+	public partial class DynamicModel
+	{
 		#region Constants
 		// Mandatory constants every DB has to define. 
 		/// <summary>
 		/// The default sequence name for initializing the pk sequence name value in the ctor. 
 		/// </summary>
-		private const string _defaultSequenceName = "";
+		private const string _defaultSequenceName = "LAST_INSERT_ID()";
 		/// <summary>
 		/// Flag to signal whether the sequence retrieval call (if any) is executed before the insert query (true) or after (false). Not a const, to avoid warnings. 
 		/// </summary>
 		private bool _sequenceValueCallsBeforeMainInsert = false;
 		#endregion
+
 
 		/// <summary>
 		/// Gets a default value for the column as defined in the schema.
@@ -107,19 +115,13 @@ namespace Massive
 			dynamic result = null;
 			switch(defaultValue.ToUpper())
 			{
-				case "CURRENT_TIME":
-					result = DateTime.UtcNow.ToString("HH:mm:ss");
-					break;
-				case "CURRENT_DATE":
-					result = DateTime.UtcNow.ToString("yyyy-MM-dd");
-					break;
 				case "CURRENT_TIMESTAMP":
-					result = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss");
+					result = DateTime.Now;
 					break;
 			}
 			return result;
 		}
-		
+
 
 		/// <summary>
 		/// Gets the aggregate function to use in a scalar query for the fragment specified
@@ -143,14 +145,14 @@ namespace Massive
 			}
 		}
 
-		
+
 		/// <summary>
-		/// Gets the sql statement to use for obtaining the identity/sequenced value of the last insert.
+		/// Gets the sql statement to use for obtaining the identity value of the last insert.
 		/// </summary>
 		/// <returns></returns>
 		protected virtual string GetIdentityRetrievalScalarStatement()
 		{
-			return "SELECT last_insert_rowid()";
+			return string.IsNullOrEmpty(_primaryKeyFieldSequence) ? string.Empty : string.Format("SELECT {0} as newID", _primaryKeyFieldSequence);
 		}
 
 
@@ -239,27 +241,7 @@ namespace Massive
 		/// <returns></returns>
 		private IEnumerable<dynamic> PostProcessSchemaQuery(IEnumerable<dynamic> toPostProcess)
 		{
-			if(toPostProcess == null)
-			{
-				return new List<dynamic>();
-			}
-			var toReturn = new List<dynamic>();
-			foreach(var row in toPostProcess)
-			{
-				var rowAsIDictionary = row as IDictionary<string, object>;
-				if(rowAsIDictionary == null)
-				{
-					continue;
-				}
-				toReturn.Add(new
-				{
-					COLUMN_NAME = rowAsIDictionary["name"].ToString(),
-					DATA_TYPE = rowAsIDictionary["type"].ToString(),
-					IS_NULLABLE = rowAsIDictionary["notnull"].ToString() == "0" ? "NO" : "YES",
-					COLUMN_DEFAULT = rowAsIDictionary["dflt_value"] ?? string.Empty,
-				});
-			}
-			return toReturn;
+			return toPostProcess == null ? new List<dynamic>() : toPostProcess.ToList();
 		}
 
 
@@ -275,21 +257,18 @@ namespace Massive
 		/// <param name="currentPage">The current page. 1-based. Default is 1.</param>
 		/// <returns>ExpandoObject with two properties: MainQuery for fetching the specified page and CountQuery for determining the total number of rows in the resultset</returns>
 		private dynamic BuildPagingQueryPair(string sql = "", string primaryKeyField = "", string whereClause = "", string orderByClause = "", string columns = "*", int pageSize = 20,
-											 int currentPage = 1)
+											  int currentPage = 1)
 		{
-			// 1) create the main query,
-			// 2) wrap it with the paging query constructs. This is done for both the count and the paging query. 
 			var orderByClauseFragment = string.IsNullOrEmpty(orderByClause) ? string.Format(" ORDER BY {0}", string.IsNullOrEmpty(primaryKeyField) ? PrimaryKeyField : primaryKeyField)
 																			: ReadifyOrderByClause(orderByClause);
 			var coreQuery = string.Format(this.GetSelectQueryPattern(0, ReadifyWhereClause(whereClause), orderByClauseFragment), columns, string.IsNullOrEmpty(sql) ? this.TableName : sql);
 			dynamic toReturn = new ExpandoObject();
-			toReturn.CountQuery = string.Format("SELECT COUNT(*) FROM ({0})", coreQuery);
+			toReturn.CountQuery = string.Format("SELECT COUNT(*) FROM ({0}) q", coreQuery);
 			var pageStart = (currentPage - 1) * pageSize;
-			// append the main query with a LIMIT clause
-			toReturn.MainQuery = string.Format("{0} LIMIT {1}, {2}", coreQuery, pageStart, pageSize);
+			toReturn.MainQuery = string.Format("{0} LIMIT {1} OFFSET {2}", coreQuery, pageSize, (pageStart + pageSize));
 			return toReturn;
 		}
-		
+
 
 		#region Properties
 		/// <summary>
@@ -297,27 +276,24 @@ namespace Massive
 		/// </summary>
 		protected virtual string DbProviderFactoryName
 		{
-			get { return "System.Data.SQLite"; }
+			get { return "MySql.Data.MySqlClient"; }
 		}
-
 
 		/// <summary>
 		/// Gets the table schema query to use to obtain meta-data for a given table and schema
 		/// </summary>
 		protected virtual string TableWithSchemaQuery
 		{
-			// SQLite doesn't support schemas.
-			get { return this.TableWithoutSchemaQuery; }
+			get { return "SELECT * FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = @0 AND TABLE_SCHEMA = @1"; }
 		}
 
 		/// <summary>
-		/// Gets the table schema query to use to obtain meta-data for a given table which is specified as the single parameter.
+		/// Gets the table schema query to use to obtain meta-data for a given table which is specified as the single parameter
 		/// </summary>
 		protected virtual string TableWithoutSchemaQuery
 		{
-			get { return $"PRAGMA table_info({this.TableName})"; }
+			get { return "SELECT * FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = @0"; }
 		}
 		#endregion
-
-    }
+	}
 }
